@@ -1,0 +1,891 @@
+From 321f7d9fe1985535c32676b94fce70688a534d2f Mon Sep 17 00:00:00 2001
+From: Samuel Henrique <150966678+zyypj@users.noreply.github.com>
+Date: Mon, 31 Aug 2026 02:15:30 -0300
+Subject: [PATCH] Add packet decode diagnostics, plugin message validation and
+ misc fixes.
+
+Bad packet reports now carry the decoding context instead of a bare id:
+Protocol#createPacket includes the id in decimal and hex, the valid range,
+the protocol phase, direction, protocol version and forge support, and
+HandlerBoss appends the connection state (remote address, decode/encode
+phase, decode direction, negotiated version, handler and closing flag) to
+the corrupted frame, bad packet and overflow warnings.
+
+Also included:
+ - PluginMessageChecks validates serverbound plugin messages in
+   InitialHandler and UpstreamBridge, and centralises REGISTER/UNREGISTER
+   channel parsing with the configured limits.
+ - PacketLimiter switched to a nanotime token bucket so bursts are smoothed
+   instead of being counted against a fixed wall clock second.
+ - Ping packets over the packet limit now get the kick message on
+   InitialHandler, and PROXY protocol address updates go through the
+   connection throttle.
+ - Fixed the modern tab limiter condition, which throttled the wrong set of
+   clients.
+ - messages.properties is now created from a bundled messages.template,
+   parsed as UTF-8 with list support, and a "shutdown" key overrides the
+   restart message when present.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java b/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java
+index 644a190c..044e552b 100644
+--- a/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java
++++ b/protocol/src/main/java/net/md_5/bungee/protocol/MinecraftDecoder.java
+@@ -24,10 +24,13 @@ public class MinecraftDecoder extends MessageToMessageDecoder<ByteBuf>
+ 
+     @Getter
+     private Protocol protocol;
++    @Getter // Zartema
+     private final boolean server;
++    @Getter // Zartema
+     @Setter
+     private int protocolVersion;
+     private boolean copyBuffer;
++    @Getter // Zartema
+     @Setter
+     private boolean supportsForge = false;
+ 
+diff --git a/protocol/src/main/java/net/md_5/bungee/protocol/Protocol.java b/protocol/src/main/java/net/md_5/bungee/protocol/Protocol.java
+index e743eb85..2c913367 100644
+--- a/protocol/src/main/java/net/md_5/bungee/protocol/Protocol.java
++++ b/protocol/src/main/java/net/md_5/bungee/protocol/Protocol.java
+@@ -1180,14 +1180,20 @@ public enum Protocol
+             ProtocolData protocolData = getProtocolData( version );
+             if ( protocolData == null )
+             {
+-                throw new BadPacketException( "Unsupported protocol version " + version );
++                // Zartema start: more context on bad packets
++                throw new BadPacketException( "Unsupported protocol version " + version + " (" + describeDecodeContext( version, supportsForge ) + ")" );
++                // Zartema end
+             }
+             if ( !hasPacket(id, supportsForge) )
+             {
+                 if ( ProtocolConstants.isBeforeOrEq( version, ProtocolConstants.MINECRAFT_1_7_6 ) ) {
+                     return null;
+                 } else {
+-                    throw new BadPacketException( "Packet with id " + id + " outside of range" );
++                    // Zartema start: more context on bad packets
++                    throw new BadPacketException( "Packet with id " + id + " (0x" + Integer.toHexString( id ) + ") outside of the valid range [0, "
++                            + MAX_PACKET_ID + " / 0x" + Integer.toHexString( MAX_PACKET_ID ) + "] - " + describeDecodeContext( version, supportsForge )
++                            + " - the stream is likely corrupted/desynced, or a mod/plugin wrote a malformed packet" );
++                    // Zartema end
+                 }
+             }
+ 
+@@ -1195,6 +1201,13 @@ public enum Protocol
+             return ( constructor == null ) ? null : constructor.get();
+         }
+ 
++        // Zartema start: decoding context used to enrich bad packet reports
++        private String describeDecodeContext(int version, boolean supportsForge)
++        {
++            return "phase=" + protocolPhase + ", direction=" + direction + ", protocolVersion=" + version + ", forgeSupport=" + supportsForge;
++        }
++        // Zartema end
++
+         private void registerPacket(Class<? extends DefinedPacket> packetClass, Supplier<? extends DefinedPacket> constructor, ProtocolMapping... mappings)
+         {
+             registerPacket( packetClass, constructor, RegisterType.BOTH, mappings );
+diff --git a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+index 4dcb4a9a..c374af4e 100644
+--- a/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
++++ b/proxy/src/main/java/net/md_5/bungee/BungeeCord.java
+@@ -18,12 +18,13 @@ import io.netty.channel.ChannelOption;
+ import io.netty.channel.EventLoopGroup;
+ import io.netty.util.ResourceLeakDetector;
+ import java.io.File;
+-import java.io.FileReader;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.io.PrintStream;
+ import java.net.InetSocketAddress;
+ import java.net.SocketAddress;
+ import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
+ import java.text.Format;
+ import java.text.MessageFormat;
+ import java.util.ArrayList;
+@@ -32,10 +33,11 @@ import java.util.Collections;
+ import java.util.Enumeration;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.MissingResourceException;
+-import java.util.PropertyResourceBundle;
+ import java.util.ResourceBundle;
+ import java.util.Timer;
+ import java.util.TimerTask;
+@@ -51,6 +53,7 @@ import lombok.Getter;
+ import lombok.Locked;
+ import lombok.Setter;
+ import lombok.Synchronized;
++import net.md_5.bungee.api.ChatColor;
+ import net.md_5.bungee.api.CommandSender;
+ import net.md_5.bungee.api.ProxyServer;
+ import net.md_5.bungee.api.ReconnectHandler;
+@@ -331,7 +334,7 @@ public class BungeeCord extends ProxyServer
+             @Override
+             public void run()
+             {
+-                independentThreadStop( getTranslation( "restart" ), false );
++                independentThreadStop( getShutdownReason(), false );
+             }
+         } );
+     }
+@@ -418,7 +421,7 @@ public class BungeeCord extends ProxyServer
+     @Override
+     public void stop()
+     {
+-        stop( getTranslation( "restart" ) );
++        stop( getShutdownReason() );
+     }
+ 
+     @Override
+@@ -434,6 +437,11 @@ public class BungeeCord extends ProxyServer
+         }.start();
+     }
+ 
++    private String getShutdownReason()
++    {
++        return messageFormats.containsKey( "shutdown" ) ? getTranslation( "shutdown" ) : getTranslation( "restart" );
++    }
++
+     // This must be run on a separate thread to avoid deadlock!
+     private void independentThreadStop(final String reason, boolean callSystemExit)
+     {
+@@ -560,11 +568,12 @@ public class BungeeCord extends ProxyServer
+         Map<String, Format> cachedFormats = new HashMap<>();
+ 
+         File file = new File( "messages.properties" );
++        ensureDefaultMessagesFile( file );
+         if ( file.isFile() )
+         {
+-            try ( FileReader rd = new FileReader( file ) )
++            try
+             {
+-                cacheResourceBundle( cachedFormats, new PropertyResourceBundle( rd ) );
++                cacheCustomMessages( cachedFormats, loadCustomMessages( file ) );
+             } catch ( IOException ex )
+             {
+                 getLogger().log( Level.SEVERE, "Could not load custom messages.properties", ex );
+@@ -584,12 +593,123 @@ public class BungeeCord extends ProxyServer
+         messageFormats = Collections.unmodifiableMap( cachedFormats );
+     }
+ 
++    private void ensureDefaultMessagesFile(File file)
++    {
++        if ( file.exists() )
++        {
++            return;
++        }
++
++        try ( InputStream in = BungeeCord.class.getClassLoader().getResourceAsStream( "messages.template" ) )
++        {
++            if ( in == null )
++            {
++                getLogger().warning( "Bundled messages template could not be found" );
++                return;
++            }
++
++            Files.copy( in, file.toPath() );
++        } catch ( IOException ex )
++        {
++            getLogger().log( Level.SEVERE, "Could not create default messages.properties", ex );
++        }
++    }
++
++    private Map<String, String> loadCustomMessages(File file) throws IOException
++    {
++        List<String> lines = Files.readAllLines( file.toPath(), StandardCharsets.UTF_8 );
++        Map<String, String> messages = new LinkedHashMap<>();
++        String listKey = null;
++        List<String> listValues = new ArrayList<>();
++
++        for ( String rawLine : lines )
++        {
++            String trimmed = rawLine.trim();
++
++            if ( listKey != null )
++            {
++                if ( trimmed.isEmpty() || trimmed.startsWith( "#" ) )
++                {
++                    continue;
++                }
++
++                if ( trimmed.startsWith( "- " ) || trimmed.equals( "-" ) )
++                {
++                    String item = trimmed.length() > 1 ? trimmed.substring( 1 ).trim() : "";
++                    listValues.add( normaliseMessageValue( item ) );
++                    continue;
++                }
++
++                messages.put( listKey, String.join( "\n", listValues ) );
++                listKey = null;
++                listValues.clear();
++            }
++
++            if ( trimmed.isEmpty() || trimmed.startsWith( "#" ) )
++            {
++                continue;
++            }
++
++            int equalsIndex = rawLine.indexOf( '=' );
++            int colonIndex = rawLine.indexOf( ':' );
++
++            if ( equalsIndex >= 0 && ( colonIndex == -1 || equalsIndex < colonIndex ) )
++            {
++                String key = rawLine.substring( 0, equalsIndex ).trim();
++                String value = rawLine.substring( equalsIndex + 1 ).trim();
++                messages.put( key, normaliseMessageValue( value ) );
++                continue;
++            }
++
++            if ( colonIndex >= 0 )
++            {
++                String key = rawLine.substring( 0, colonIndex ).trim();
++                String value = rawLine.substring( colonIndex + 1 ).trim();
++                if ( value.isEmpty() )
++                {
++                    listKey = key;
++                } else
++                {
++                    messages.put( key, normaliseMessageValue( value ) );
++                }
++            }
++        }
++
++        if ( listKey != null )
++        {
++            messages.put( listKey, String.join( "\n", listValues ) );
++        }
++
++        return messages;
++    }
++
++    private void cacheCustomMessages(Map<String, Format> map, Map<String, String> messages)
++    {
++        for ( Map.Entry<String, String> entry : messages.entrySet() )
++        {
++            map.put( entry.getKey(), new MessageFormat( entry.getValue() ) );
++        }
++    }
++
++    private String normaliseMessageValue(String value)
++    {
++        String normalised = value;
++
++        if ( ( normalised.startsWith( "'" ) && normalised.endsWith( "'" ) ) || ( normalised.startsWith( "\"" ) && normalised.endsWith( "\"" ) ) )
++        {
++            normalised = normalised.substring( 1, normalised.length() - 1 );
++        }
++
++        normalised = normalised.replace( "\\n", "\n" );
++        return ChatColor.translateAlternateColorCodes( '&', normalised );
++    }
++
+     private void cacheResourceBundle(Map<String, Format> map, ResourceBundle resourceBundle)
+     {
+         Enumeration<String> keys = resourceBundle.getKeys();
+         while ( keys.hasMoreElements() )
+         {
+-            map.computeIfAbsent( keys.nextElement(), (key) -> new MessageFormat( resourceBundle.getString( key ) ) );
++            map.computeIfAbsent( keys.nextElement(), (key) -> new MessageFormat( ChatColor.translateAlternateColorCodes( '&', resourceBundle.getString( key ) ) ) );
+         }
+     }
+ 
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index f8f1db92..1acb0d8d 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -85,6 +85,7 @@ import net.md_5.bungee.protocol.packet.StatusRequest;
+ import net.md_5.bungee.protocol.packet.StatusResponse;
+ import net.md_5.bungee.util.AllowedCharacters;
+ import net.md_5.bungee.util.BufUtil;
++import net.md_5.bungee.util.PluginMessageChecks;
+ import net.md_5.bungee.util.QuietException;
+ 
+ @RequiredArgsConstructor
+@@ -215,6 +216,15 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+     @Override
+     public void handle(PluginMessage pluginMessage) throws Exception
+     {
++        try
++        {
++            PluginMessageChecks.validateServerbound( pluginMessage, getVersion(), bungee.config.isForgeSupport() );
++        } catch ( IllegalArgumentException ex )
++        {
++            disconnect( bungee.getTranslation( "invalid_plugin_message" ) );
++            throw CancelSendSignal.INSTANCE;
++        }
++
+         // Waterfall start
+         try {
+             this.relayMessage(pluginMessage);
+@@ -886,21 +896,16 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+     {
+         if ( input.getTag().equals( "REGISTER" ) || input.getTag().equals( "minecraft:register" ) )
+         {
+-            String content = new String( input.getData(), StandardCharsets.UTF_8 );
+-
+-            for ( String id : content.split( "\0" ) )
++            for ( String id : PluginMessageChecks.readRegisteredChannels( input, bungee.getConfig().getPluginChannelLimit(), bungee.getConfig().getPluginChannelNameLimit() ) )
+             {
+                 // Waterfall start: Add configurable limits for plugin messaging
+-                Preconditions.checkState( !(registeredChannels.size() > bungee.getConfig().getPluginChannelLimit()), "Too many registered channels. This limit can be configured in the waterfall.yml" );
+-                Preconditions.checkArgument( !(id.length() > bungee.getConfig().getPluginChannelNameLimit()), "Channel name too long. This limit can be configured in the waterfall.yml" );
++                Preconditions.checkState( registeredChannels.size() < bungee.getConfig().getPluginChannelLimit(), "Too many registered channels. This limit can be configured in the waterfall.yml" );
+                 // Waterfall end
+                 registeredChannels.add( id );
+             }
+         } else if ( input.getTag().equals( "UNREGISTER" ) || input.getTag().equals( "minecraft:unregister" ) )
+         {
+-            String content = new String( input.getData(), StandardCharsets.UTF_8 );
+-
+-            for ( String id : content.split( "\0" ) )
++            for ( String id : PluginMessageChecks.readRegisteredChannels( input, bungee.getConfig().getPluginChannelLimit(), bungee.getConfig().getPluginChannelNameLimit() ) )
+             {
+                 registeredChannels.remove( id );
+             }
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/UpstreamBridge.java b/proxy/src/main/java/net/md_5/bungee/connection/UpstreamBridge.java
+index a48eeaa2..9d44e015 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/UpstreamBridge.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/UpstreamBridge.java
+@@ -45,6 +45,7 @@ import net.md_5.bungee.protocol.packet.UnsignedClientCommand;
+ import net.md_5.bungee.protocol.util.TagUtil;
+ import net.md_5.bungee.protocol.packet.ResourcePack;
+ import net.md_5.bungee.util.AllowedCharacters;
++import net.md_5.bungee.util.PluginMessageChecks;
+ 
+ public class UpstreamBridge extends PacketHandler
+ {
+@@ -252,8 +253,8 @@ public class UpstreamBridge extends PacketHandler
+     {
+         // Waterfall start - tab limiter
+         if ( bungee.getConfig().getTabThrottle() > 0 &&
+-                ( con.getPendingConnection().getVersion() >= ProtocolConstants.MINECRAFT_1_13
+-                && !bungee.getConfig().isDisableModernTabLimiter()))
++                ( con.getPendingConnection().getVersion() < ProtocolConstants.MINECRAFT_1_13
++                || !bungee.getConfig().isDisableModernTabLimiter() ) )
+         {
+             long now = System.currentTimeMillis();
+             if ( lastTabCompletion > 0 && (now - lastTabCompletion) <= bungee.getConfig().getTabThrottle() )
+@@ -334,6 +335,15 @@ public class UpstreamBridge extends PacketHandler
+     @Override
+     public void handle(PluginMessage pluginMessage) throws Exception
+     {
++        try
++        {
++            PluginMessageChecks.validateServerbound( pluginMessage, con.getPendingConnection().getVersion(), BungeeCord.getInstance().config.isForgeSupport() );
++        } catch ( IllegalArgumentException ex )
++        {
++            con.disconnect( bungee.getTranslation( "invalid_plugin_message" ) );
++            throw CancelSendSignal.INSTANCE;
++        }
++
+         if ( pluginMessage.getTag().equals( PluginMessage.BUNGEE_CHANNEL_LEGACY ) || pluginMessage.getTag().equals( PluginMessage.BUNGEE_CHANNEL_MODERN ) )
+         {
+             throw CancelSendSignal.INSTANCE;
+diff --git a/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java b/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java
+index 969c2db4..e16f583c 100644
+--- a/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java
++++ b/proxy/src/main/java/net/md_5/bungee/netty/HandlerBoss.java
+@@ -20,10 +20,13 @@ import net.md_5.bungee.connection.InitialHandler;
+ import net.md_5.bungee.connection.PingHandler;
+ import net.md_5.bungee.connection.UpstreamBridge;
+ import net.md_5.bungee.protocol.BadPacketException;
++import net.md_5.bungee.protocol.MinecraftDecoder; // Zartema
++import net.md_5.bungee.protocol.MinecraftEncoder; // Zartema
+ import net.md_5.bungee.protocol.OverflowPacketException;
+ import net.md_5.bungee.protocol.PacketWrapper;
+ import net.md_5.bungee.protocol.Protocol;
+ import net.md_5.bungee.protocol.packet.Kick;
++import net.md_5.bungee.protocol.packet.PingPacket;
+ import net.md_5.bungee.util.PacketLimiter;
+ import net.md_5.bungee.util.QuietException;
+ 
+@@ -103,6 +106,15 @@ public class HandlerBoss extends ChannelInboundHandlerAdapter
+                         channel.getRemoteAddress(), newAddress
+                     } );
+ 
++                    if ( handler instanceof InitialHandler || handler instanceof PingHandler )
++                    {
++                        if ( BungeeCord.getInstance().getConnectionThrottle() != null && BungeeCord.getInstance().getConnectionThrottle().throttle( newAddress ) )
++                        {
++                            this.channel.close();
++                            return;
++                        }
++                    }
++
+                     channel.setRemoteAddress( newAddress );
+ 
+                     // Zartema start
+@@ -132,7 +144,7 @@ public class HandlerBoss extends ChannelInboundHandlerAdapter
+             {
+                 // we shouldn't tell the player what limits he exceeds by default
+                 // but if someone applies custom message we should allow them to display counter and bytes
+-                channel.close( handler instanceof UpstreamBridge ? new Kick( TextComponent.fromLegacy( ProxyServer.getInstance().getTranslation( "packet_limit_kick", limiter.getCounter(), limiter.getDataCounter() ) ) ) : null );
++                channel.close( ( handler instanceof UpstreamBridge || ( handler instanceof InitialHandler && packet.packet instanceof PingPacket ) ) ? new Kick( TextComponent.fromLegacy( ProxyServer.getInstance().getTranslation( "packet_limit_kick", limiter.getCounter(), limiter.getDataCounter() ) ) ) : null );
+                 // but the server admin should know
+                 ProxyServer.getInstance().getLogger().log( Level.WARNING, "{0} exceeded packet limit ({1} packets and {2} bytes per second)", new Object[]
+                 {
+@@ -174,6 +186,43 @@ public class HandlerBoss extends ChannelInboundHandlerAdapter
+         }
+     }
+ 
++    // Zartema start: describes the state of the connection when a decoder error happens
++    private String describeConnection()
++    {
++        ChannelWrapper channel = this.channel;
++        if ( channel == null )
++        {
++            return "unknown (channel not initialised)";
++        }
++
++        StringBuilder context = new StringBuilder();
++        context.append( "remote=" ).append( channel.getRemoteAddress() );
++
++        MinecraftDecoder decoder = channel.getMinecraftDecoder();
++        if ( decoder != null )
++        {
++            context.append( ", decodePhase=" ).append( decoder.getProtocol() );
++            context.append( ", decodeDirection=" ).append( decoder.isServer() ? "TO_SERVER" : "TO_CLIENT" );
++            context.append( ", protocolVersion=" ).append( decoder.getProtocolVersion() );
++            context.append( ", forgeSupport=" ).append( decoder.isSupportsForge() );
++        } else
++        {
++            context.append( ", decodePhase=unknown" );
++        }
++
++        MinecraftEncoder encoder = channel.getMinecraftEncoder();
++        if ( encoder != null )
++        {
++            context.append( ", encodePhase=" ).append( encoder.getProtocol() );
++        }
++
++        context.append( ", handler=" ).append( ( handler == null ) ? "none" : handler.getClass().getSimpleName() );
++        context.append( ", closing=" ).append( channel.isClosing() );
++
++        return context.toString();
++    }
++    // Zartema end
++
+     @Override
+     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception
+     {
+@@ -201,22 +250,28 @@ public class HandlerBoss extends ChannelInboundHandlerAdapter
+                     // Waterfall end
+                     if ( cause instanceof CorruptedFrameException )
+                     {
+-                        ProxyServer.getInstance().getLogger().log( Level.WARNING, "{0} - corrupted frame: {1}", new Object[]
++                        // Zartema start: more context on bad packets
++                        ProxyServer.getInstance().getLogger().log( Level.WARNING, "{0} - corrupted frame: {1} | connection: {2}", new Object[]
+                         {
+-                            handler, cause.getMessage()
++                            handler, cause.getMessage(), describeConnection()
+                         } );
++                        // Zartema end
+                     } else if ( cause.getCause() instanceof BadPacketException )
+                     {
+-                        ProxyServer.getInstance().getLogger().log( Level.WARNING, "{0} - bad packet, are mods in use!? {1}", new Object[]
++                        // Zartema start: more context on bad packets
++                        ProxyServer.getInstance().getLogger().log( Level.WARNING, "{0} - bad packet, are mods in use!? {1} | connection: {2}", new Object[]
+                         {
+-                            handler, cause.getCause().getMessage()
++                            handler, cause.getCause().getMessage(), describeConnection()
+                         } );
++                        // Zartema end
+                     } else if ( cause.getCause() instanceof OverflowPacketException )
+                     {
+-                        ProxyServer.getInstance().getLogger().log( Level.WARNING, "{0} - overflow in packet detected! {1}", new Object[]
++                        // Zartema start: more context on bad packets
++                        ProxyServer.getInstance().getLogger().log( Level.WARNING, "{0} - overflow in packet detected! {1} | connection: {2}", new Object[]
+                         {
+-                            handler, cause.getCause().getMessage()
++                            handler, cause.getCause().getMessage(), describeConnection()
+                         } );
++                        // Zartema end
+                     } else
+                     {
+                         ProxyServer.getInstance().getLogger().log( Level.WARNING, handler + " - could not decode packet!", cause );
+diff --git a/proxy/src/main/java/net/md_5/bungee/util/PacketLimiter.java b/proxy/src/main/java/net/md_5/bungee/util/PacketLimiter.java
+index ea89d240..56a69fb6 100644
+--- a/proxy/src/main/java/net/md_5/bungee/util/PacketLimiter.java
++++ b/proxy/src/main/java/net/md_5/bungee/util/PacketLimiter.java
+@@ -16,7 +16,10 @@ public class PacketLimiter
+     private int counter;
+     @Getter
+     private int dataCounter;
+-    private long nextSecond;
++    private long windowStartMillis;
++    private long lastRefillNanos;
++    private double packetBudget;
++    private double dataBudget;
+ 
+     /**
+      * Counts the received packet amount and size.
+@@ -26,20 +29,53 @@ public class PacketLimiter
+      */
+     public boolean incrementAndCheck(int size)
+     {
+-        counter++;
+-        dataCounter += size;
++        long nowNanos = System.nanoTime();
++        long nowMillis = System.currentTimeMillis();
+ 
+-        if ( ( limit > 0 && counter > limit ) || ( dataLimit > 0 && dataCounter > dataLimit ) )
++        if ( lastRefillNanos == 0L )
++        {
++            lastRefillNanos = nowNanos;
++            windowStartMillis = nowMillis;
++            packetBudget = limit;
++            dataBudget = dataLimit;
++        } else
+         {
+-            long now = System.currentTimeMillis();
+-            if ( nextSecond > now )
++            double elapsedSeconds = ( nowNanos - lastRefillNanos ) / 1_000_000_000D;
++            lastRefillNanos = nowNanos;
++
++            if ( limit > 0 )
++            {
++                packetBudget = Math.min( limit, packetBudget + ( elapsedSeconds * limit ) );
++            }
++            if ( dataLimit > 0 )
++            {
++                dataBudget = Math.min( dataLimit, dataBudget + ( elapsedSeconds * dataLimit ) );
++            }
++            if ( nowMillis - windowStartMillis >= 1000L )
+             {
+-                return false;
++                counter = 0;
++                dataCounter = 0;
++                windowStartMillis = nowMillis;
+             }
+-            nextSecond = now + 1000;
+-            counter = 0;
+-            dataCounter = 0;
+         }
++
++        counter++;
++        dataCounter += size;
++
++        if ( ( limit > 0 && packetBudget < 1D ) || ( dataLimit > 0 && dataBudget < size ) )
++        {
++            return false;
++        }
++
++        if ( limit > 0 )
++        {
++            packetBudget -= 1D;
++        }
++        if ( dataLimit > 0 )
++        {
++            dataBudget -= size;
++        }
++
+         return true;
+     }
+ }
+diff --git a/proxy/src/main/java/net/md_5/bungee/util/PluginMessageChecks.java b/proxy/src/main/java/net/md_5/bungee/util/PluginMessageChecks.java
+new file mode 100644
+index 00000000..ff856070
+--- /dev/null
++++ b/proxy/src/main/java/net/md_5/bungee/util/PluginMessageChecks.java
+@@ -0,0 +1,104 @@
++package net.md_5.bungee.util;
++
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++
++import net.md_5.bungee.forge.ForgeConstants;
++import net.md_5.bungee.protocol.ProtocolConstants;
++import net.md_5.bungee.protocol.packet.PluginMessage;
++
++public final class PluginMessageChecks
++{
++
++    private static final int MAX_REGISTER_PAYLOAD_SIZE = Integer.getInteger( "zartema.maxRegisterPayloadSize", 8192 );
++    private static final int MAX_BRAND_PAYLOAD_SIZE = Integer.getInteger( "zartema.maxBrandPayloadSize", 256 );
++    private static final int MAX_LEGACY_PLUGIN_MESSAGE_SIZE = Integer.getInteger( "zartema.maxLegacyPluginMessageSize", 8192 );
++    private static final int MAX_REGISTER_CHANNELS_PER_MESSAGE = Integer.getInteger( "zartema.maxRegisterChannelsPerMessage", 64 );
++
++    private PluginMessageChecks()
++    {
++    }
++
++    public static void validateServerbound(PluginMessage pluginMessage, int protocolVersion, boolean forgeSupport)
++    {
++        String tag = pluginMessage.getTag();
++        byte[] data = pluginMessage.getData();
++
++        if ( isRegisterChannel( tag ) )
++        {
++            ensure( data.length <= MAX_REGISTER_PAYLOAD_SIZE, "REGISTER payload too large" );
++            return;
++        }
++
++        if ( isBrandChannel( tag ) )
++        {
++            ensure( data.length <= MAX_BRAND_PAYLOAD_SIZE, "Brand payload too large" );
++            return;
++        }
++
++        if ( isForgeChannel( tag ) )
++        {
++            ensure( forgeSupport, "Forge plugin messages are disabled" );
++            return;
++        }
++
++        if ( protocolVersion <= ProtocolConstants.MINECRAFT_1_12_2 )
++        {
++            ensure( data.length <= MAX_LEGACY_PLUGIN_MESSAGE_SIZE, "Legacy plugin message payload too large" );
++        }
++    }
++
++    public static List<String> readRegisteredChannels(PluginMessage pluginMessage, int channelLimit, int channelNameLimit)
++    {
++        byte[] data = pluginMessage.getData();
++        ensure( data.length <= MAX_REGISTER_PAYLOAD_SIZE, "REGISTER payload too large" );
++
++        String content = new String( data, StandardCharsets.UTF_8 );
++        String[] parts = content.split( "\0", -1 );
++        ensure( parts.length <= Math.min( channelLimit, MAX_REGISTER_CHANNELS_PER_MESSAGE ), "Too many channels in a single REGISTER payload" );
++
++        List<String> channels = new ArrayList<>( parts.length );
++        for ( String channel : parts )
++        {
++            validateChannelIdentifier( channel, channelNameLimit );
++            channels.add( channel );
++        }
++        return channels;
++    }
++
++    private static void validateChannelIdentifier(String channel, int channelNameLimit)
++    {
++        ensure( !channel.isEmpty(), "Channel name cannot be empty" );
++        ensure( channel.length() <= channelNameLimit, "Channel name too long" );
++
++        for ( int i = 0; i < channel.length(); i++ )
++        {
++            char c = channel.charAt( i );
++            ensure( c >= 33 && c <= 126, "Channel name contains invalid characters" );
++        }
++    }
++
++    private static boolean isRegisterChannel(String tag)
++    {
++        return "REGISTER".equals( tag ) || "UNREGISTER".equals( tag ) || "minecraft:register".equals( tag ) || "minecraft:unregister".equals( tag );
++    }
++
++    private static boolean isBrandChannel(String tag)
++    {
++        return "MC|Brand".equals( tag ) || "minecraft:brand".equals( tag );
++    }
++
++    private static boolean isForgeChannel(String tag)
++    {
++        return ForgeConstants.FML_TAG.equals( tag ) || ForgeConstants.FML_HANDSHAKE_TAG.equals( tag ) || ForgeConstants.FORGE_REGISTER.equals( tag );
++    }
++
++    private static void ensure(boolean condition, String message)
++    {
++        if ( !condition )
++        {
++            throw new IllegalArgumentException( message );
++        }
++    }
++}
+diff --git a/proxy/src/main/resources/messages.properties b/proxy/src/main/resources/messages.properties
+index 94254c9a..2382cb21 100644
+--- a/proxy/src/main/resources/messages.properties
++++ b/proxy/src/main/resources/messages.properties
+@@ -1,45 +1,47 @@
+-alert=\u00a78[\u00a74Alert\u00a78]\u00a7r 
+-already_connected=\u00a7cYou are already connected to this server!
+-already_connected_proxy=\u00a7cYou are already connected to this proxy!
+-already_connecting=\u00a7cAlready connecting to this server!
+-command_list=\u00a7a[{0}] \u00a7e({1}): \u00a7r{2}
+-connect_kick=\u00a7cKicked whilst connecting to {0}: {1}
+-current_server=\u00a76You are currently connected to {0}.
+-fallback_kick=\u00a7cCould not connect to a default or fallback server. Incorrectly configured address/port/firewall? {0}
+-fallback_lobby=\u00a7cCould not connect to target server, you have been moved to a fallback server.
+-lost_connection=\u00a7cProxy lost connection to server.
+-mojang_fail=\u00a7cError occurred while contacting login servers, are they down?
+-no_permission=\u00a7cYou do not have permission to execute this command!
+-no_server=\u00a7cThe specified server does not exist.
+-no_server_permission=\u00a7cYou don''t have permission to access this server.
+-outdated_client=\u00a7cOutdated client! Please use {0}
+-outdated_server=\u00a7cOutdated server! I''m still on {0}
+-proxy_full=\u00a7cServer is full!
+-restart=\u00a7cThe proxy server is restarting
+-server_list=\u00a76You may connect to the following servers at this time: 
+-server_went_down=\u00a7cThe server you were previously on went down, you have been connected to a fallback server
+-total_players=Total players online: {0}
+-name_invalid=\u00a7cUsername contains invalid characters.
+-ping_cannot_connect=\u00a7cCould not request status from target server.
+-offline_mode_player=\u00a7cNot authenticated with Minecraft.net
+-secure_profile_required=\u00a7cA secure profile is required to join this server.
+-secure_profile_expired=\u00a7cSecure profile expired.
+-secure_profile_invalid=\u00a7cSecure profile invalid.
+-secure_profile_unsupported=\u00a7cOutdated client, secure profile not supported. Please use 1.19 or newer.
+-message_needed=\u00a7cYou must supply a message.
+-error_occurred_player=\u00a7cAn error occurred while parsing your message. (Hover for details)
+-error_occurred_console=\u00a7cAn error occurred while parsing your message: {0}
+-click_to_connect=Click to connect to the server
+-username_needed=\u00a7cPlease follow this command by a username.
+-user_not_online=\u00a7cThat user is not online.
+-user_online_at=\u00a7a{0} \u00a7ris online at {1}
+-send_cmd_usage=\u00a7cNot enough arguments, usage: /send <server|player|all|current> <target>
+-player_only=\u00a7cOnly in game players can use this command
+-you_got_summoned=\u00a76Summoned to {0} by {1}
+-command_perms_groups=\u00a76You have the following groups: {0}
+-command_perms_permission=\u00a79- {0}
+-command_ip=\u00a79IP of {0} is {1}
+-illegal_chat_characters=\u00a7cIllegal characters in chat ({0})
+-kick_message=\u00a7cYou have been kicked off the proxy.
+-reject_transfer=\u00a7cYour transfer was rejected.
+-packet_limit_kick=\u00a7cYou have sent too many packets
++alert=&8[&4Alerta&8] &r
++already_connected=&cVocê já está conectado a este servidor!
++already_connected_proxy=&cVocê já está conectado a este proxy!
++already_connecting=&cVocê já está se conectando a este servidor!
++command_list=&a[{0}] &e({1}): &r{2}
++connect_kick=&cVocê foi expulso ao conectar em {0}: {1}
++current_server=&6Você está conectado atualmente em {0}.
++fallback_kick=&cNão foi possível conectá-lo a um servidor padrão ou de fallback. {0}
++fallback_lobby=&cNão foi possível conectar ao servidor de destino; você foi movido para um fallback.
++lost_connection=&cO proxy perdeu a conexão com o servidor.
++mojang_fail=&cOcorreu um erro ao contatar os servidores de login. Eles estão offline?
++no_permission=&cVocê não tem permissão para executar este comando!
++no_server=&cO servidor especificado não existe.
++no_server_permission=&cVocê não tem permissão para acessar este servidor.
++outdated_client=&cCliente desatualizado! Use a versão {0}
++outdated_server=&cServidor desatualizado! Ainda estou na versão {0}
++proxy_full=&cO proxy está lotado!
++restart=&cO proxy está reiniciando.
++shutdown=&cO proxy está desligando.
++server_list=&6Você pode se conectar aos seguintes servidores agora:
++server_went_down=&cO servidor em que você estava caiu; você foi conectado a um servidor de fallback.
++total_players=Total de jogadores online: {0}
++name_invalid=&cO nome de usuário contém caracteres inválidos.
++ping_cannot_connect=&cNão foi possível consultar o status do servidor de destino.
++offline_mode_player=&cVocê não está autenticado com a Minecraft.net
++secure_profile_required=&cUm perfil seguro é necessário para entrar neste servidor.
++secure_profile_expired=&cO perfil seguro expirou.
++secure_profile_invalid=&cO perfil seguro é inválido.
++secure_profile_unsupported=&cCliente desatualizado; perfil seguro não é suportado. Use 1.19 ou superior.
++message_needed=&cVocê precisa informar uma mensagem.
++error_occurred_player=&cOcorreu um erro ao processar sua mensagem. (Passe o mouse para ver detalhes)
++error_occurred_console=&cOcorreu um erro ao processar sua mensagem: {0}
++click_to_connect=Clique para conectar ao servidor
++username_needed=&cVocê precisa informar um nome de usuário após este comando.
++user_not_online=&cEsse jogador não está online.
++user_online_at=&a{0} &restá online em {1}
++send_cmd_usage=&cArgumentos insuficientes. Uso: /send <server|player|all|current> <target>
++player_only=&cSomente jogadores em jogo podem usar este comando
++you_got_summoned=&6Você foi invocado para {0} por {1}
++command_perms_groups=&6Você possui os seguintes grupos: {0}
++command_perms_permission=&9- {0}
++command_ip=&9O IP de {0} é {1}
++illegal_chat_characters=&cCaracteres ilegais no chat ({0})
++kick_message=&cVocê foi desconectado do proxy.
++reject_transfer=&cSua transferência foi rejeitada.
++packet_limit_kick=&cVocê enviou pacotes demais.
++invalid_plugin_message=&cUma mensagem de plugin inválida foi recebida.
+diff --git a/proxy/src/main/resources/messages.template b/proxy/src/main/resources/messages.template
+new file mode 100644
+index 00000000..60f50299
+--- /dev/null
++++ b/proxy/src/main/resources/messages.template
+@@ -0,0 +1,83 @@
++# Arquivo de mensagens do Zartema
++# Sintaxes aceitas:
++# chave=valor
++# chave:
++# - 'linha 1'
++# - ''
++# - '&7linha 3'
++
++alert=&8[&4Alerta&8] &r
++already_connected=&cVocê já está conectado a este servidor!
++already_connected_proxy=&cVocê já está conectado a este proxy!
++already_connecting=&cVocê já está se conectando a este servidor!
++command_list=&a[{0}] &e({1}): &r{2}
++
++connect_kick:
++- '&cVocê foi expulso ao conectar em {0}:'
++- '&7{1}'
++
++current_server=&6Você está conectado atualmente em {0}.
++
++fallback_kick:
++- '&cNão foi possível conectá-lo a um servidor padrão ou de fallback.'
++- '&7Detalhes: {0}'
++
++fallback_lobby=&cNão foi possível conectar ao servidor de destino; você foi movido para um fallback.
++
++lost_connection:
++- '&cO proxy perdeu a conexão com o servidor.'
++- '&7Tente novamente em alguns instantes.'
++
++mojang_fail=&cOcorreu um erro ao contatar os servidores de login. Eles estão offline?
++no_permission=&cVocê não tem permissão para executar este comando!
++no_server=&cO servidor especificado não existe.
++no_server_permission=&cVocê não tem permissão para acessar este servidor.
++outdated_client=&cCliente desatualizado! Use a versão {0}
++outdated_server=&cServidor desatualizado! Ainda estou na versão {0}
++
++proxy_full:
++- '&cO proxy está lotado!'
++- '&7Tente novamente em instantes.'
++
++restart:
++- '&cO proxy está reiniciando.'
++- '&7Reconecte em alguns segundos.'
++
++shutdown:
++- '&cO proxy está desligando.'
++- '&7Tente novamente em instantes.'
++
++server_list=&6Você pode se conectar aos seguintes servidores agora:
++server_went_down=&cO servidor em que você estava caiu; você foi conectado a um servidor de fallback.
++total_players=Total de jogadores online: {0}
++name_invalid=&cO nome de usuário contém caracteres inválidos.
++ping_cannot_connect=&cNão foi possível consultar o status do servidor de destino.
++offline_mode_player=&cVocê não está autenticado com a Minecraft.net
++secure_profile_required=&cUm perfil seguro é necessário para entrar neste servidor.
++secure_profile_expired=&cO perfil seguro expirou.
++secure_profile_invalid=&cO perfil seguro é inválido.
++secure_profile_unsupported=&cCliente desatualizado; perfil seguro não é suportado. Use 1.19 ou superior.
++message_needed=&cVocê precisa informar uma mensagem.
++error_occurred_player=&cOcorreu um erro ao processar sua mensagem. (Passe o mouse para ver detalhes)
++error_occurred_console=&cOcorreu um erro ao processar sua mensagem: {0}
++click_to_connect=Clique para conectar ao servidor
++username_needed=&cVocê precisa informar um nome de usuário após este comando.
++user_not_online=&cEsse jogador não está online.
++user_online_at=&a{0} &restá online em {1}
++send_cmd_usage=&cArgumentos insuficientes. Uso: /send <server|player|all|current> <target>
++player_only=&cSomente jogadores em jogo podem usar este comando
++you_got_summoned=&6Você foi invocado para {0} por {1}
++command_perms_groups=&6Você possui os seguintes grupos: {0}
++command_perms_permission=&9- {0}
++command_ip=&9O IP de {0} é {1}
++illegal_chat_characters=&cCaracteres ilegais no chat ({0})
++
++kick_message:
++- '&cVocê foi desconectado do proxy.'
++
++reject_transfer=&cSua transferência foi rejeitada.
++packet_limit_kick=&cVocê enviou pacotes demais.
++
++invalid_plugin_message:
++- '&cUma mensagem de plugin inválida foi recebida.'
++- '&7Se isso persistir, contate a equipe.'
+-- 
+2.53.0.windows.2
+
